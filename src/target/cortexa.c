@@ -358,6 +358,12 @@ bool cortexa_probe(ADIv5_AP_t *apb, uint32_t debug_base)
 	t->breakwatch_set = cortexa_breakwatch_set;
 	t->breakwatch_clear = cortexa_breakwatch_clear;
 
+#define PROBE(x) \
+	do { if ((x)(t)) return true; else target_check_error(t); } while (0)
+
+	PROBE(iproc_probe);
+#undef PROBE
+
 	return true;
 }
 

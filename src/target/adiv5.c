@@ -451,7 +451,7 @@ void adiv5_dp_init(ADIv5_DP_t *dp)
 		 * AP should be unref'd if not valid.
 		 */
 
-		/* The rest sould only be added after checking ROM table */
+		/* The rest should only be added after checking ROM table */
 		adiv5_component_probe(ap, ap->base);
 	}
 	adiv5_dp_unref(dp);

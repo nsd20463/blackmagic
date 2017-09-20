@@ -182,6 +182,11 @@ static const char tdesc_cortex_a[] =
 	"  </feature>"
 	"</target>";
 
+static inline ADIv5_AP_t *cortexa_ap(target *t)
+{
+	return ((struct cortexa_priv *)t->priv)->apb;
+}
+
 static void apb_write(target *t, uint16_t reg, uint32_t val)
 {
 	struct cortexa_priv *priv = t->priv;
@@ -216,6 +221,7 @@ static uint32_t va_to_pa(target *t, uint32_t va)
 	return pa;
 }
 
+#if 0
 static void cortexa_slow_mem_read(target *t, void *dest, target_addr src, size_t len)
 {
 	struct cortexa_priv *priv = t->priv;
@@ -308,6 +314,17 @@ static void cortexa_slow_mem_write(target *t, target_addr dest, const void *src,
 		priv->mmu_fault = true;
 	}
 }
+#endif
+
+static void cortexa_mem_read(target *t, void *dest, target_addr src, size_t len)
+{
+	adiv5_mem_read(cortexa_ap(t), dest, src, len);
+}
+
+static void cortexa_mem_write(target *t, target_addr dest, const void *src, size_t len)
+{
+	adiv5_mem_write(cortexa_ap(t), dest, src, len);
+}
 
 static bool cortexa_check_error(target *t)
 {
@@ -328,8 +345,8 @@ bool cortexa_probe(ADIv5_AP_t *apb, uint32_t debug_base)
 	t->priv = priv;
 	t->priv_free = free;
 	priv->apb = apb;
-	t->mem_read = cortexa_slow_mem_read;
-	t->mem_write = cortexa_slow_mem_write;
+	t->mem_read = cortexa_mem_read;
+	t->mem_write = cortexa_mem_write;
 
 	priv->base = debug_base;
 	/* Set up APB CSW, we won't touch this again */

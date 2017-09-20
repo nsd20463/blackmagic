@@ -66,7 +66,51 @@
 #define IPROC_NAND_ecc_uncorr (IPROC_CCA_NAND+0xf18)
 #define IPROC_NAND_ecc_corr (IPROC_CCA_NAND+0xf1c)
 
-bool iproc_cmd_id(target *t)
+static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t len)
+{
+	//target *t = f->t;
+	addr -= f->start;
+	while (len) {
+		// erase the block at offset 'addr'
+		DEBUG("pretend iproc erase at %"PRIx32"\n", addr);
+		addr += f->blocksize;
+		len -= f->blocksize;
+	}
+
+	return 0;
+}
+
+static int iproc_flash_write(struct target_flash *f, target_addr dest,
+                             const void *src, size_t len)
+{
+	target *t = f->t;
+	int rc = target_mem_write(t, IPROC_NAND_FLASH_CACHE(0), src, len);
+	if (rc)
+		return rc;
+
+	dest -= f->start;
+
+	DEBUG("pretend iproc write %zu at %"PRIx32"\n", len, dest);
+
+	return 0;
+}
+
+static int iproc_flash_read(struct target_flash *f, void *dst,
+                             target_addr dest, size_t len)
+{
+	target *t = f->t;
+	int rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), len);
+	if (rc)
+		return rc;
+
+	dest -= f->start;
+
+	DEBUG("pretend iproc read %zu at %"PRIx32"\n", len, dest);
+
+	return 0;
+}
+
+static bool iproc_cmd_id_hw(target *t)
 {
 	uint32_t x = target_mem_read32(t, IPROC_CCA_CHIPID);
 	tc_printf(t, "CCA_CHIPID 0x%"PRIx32"\n", x);
@@ -80,37 +124,49 @@ bool iproc_cmd_id(target *t)
 	return true;
 }
 
-const struct command_s iproc_cmd_list[] = {
-	{"id", (cmd_handler)iproc_cmd_id, "Show device id registers"},
-	{NULL, NULL, NULL}
-};
-
-static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t len)
+static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 {
-	//target *t = f->t;
-	addr -= f->start;
-	while (len) {
-		// erase the block at offset 'addr'
-		DEBUG("iproc erase at %"PRIx32"\n", addr);
-		addr += f->blocksize;
-		len -= f->blocksize;
+	if (argc != 2) {
+		tc_printf(t, "usage: nand-read <pagenum>\n");
+		return false;
 	}
 
-	return 0;
+	// arg is the NAND page number
+	unsigned long pagenum = strtoul(argv[1], NULL, 0);
+
+	struct target_flash* f = t->flash;
+	if (!f) {
+		// no flash was found
+		return false;
+	}
+
+	const int page_size = 2048;
+	uint8_t buf[page_size];
+	memset(buf, 0xff, page_size);
+	int rc = iproc_flash_read(f, buf, (target_addr)pagenum * page_size, page_size);
+	if (rc) {
+		tc_printf(t, "read failed: %d\n", rc);
+		return false;
+	}
+
+	tc_printf(t, "NAND page %lu\n", pagenum);
+	for (int i=0; i<page_size; i+=16) {
+		tc_printf(t, "%03x: ", i);
+		for (int j=0; j<16; j++) {
+			uint8_t x = buf[i+j];
+			tc_printf(t, "%02x ", x);
+		}
+		tc_printf(t, "\n");
+	}
+
+	return true;
 }
 
-static int iproc_flash_write(struct target_flash *f, target_addr dest,
-                             const void *src, size_t len)
-{
-	target *t = f->t;
-	target_mem_write(t, IPROC_NAND_FLASH_CACHE(0), src, len);
-
-	dest -= f->start;
-
-	DEBUG("iproc write %zu at %"PRIx32"\n", len, dest);
-
-	return 0;
-}
+const struct command_s iproc_cmd_list[] = {
+	{"id-hw", (cmd_handler)iproc_cmd_id_hw, "Show iproc id registers"},
+	{"nand-read", iproc_cmd_nand_read, "Show NAND page"},
+	{NULL, NULL, NULL}
+};
 
 bool iproc_watchdog_disable(target *t)
 {
@@ -141,7 +197,8 @@ bool iproc_watchdog_disable(target *t)
 bool iproc_probe(target *t)
 {
 	DEBUG("iproc_probe\n");
-	// TODO what happens on other CPUs when we read this strange address?
+
+	// TODO what happens on other CPUs when we read this address?
 	// I'd really like a better way to ID an iproc, but there isn't anything non-generic
 	// in the AP registers that I can find.
 
@@ -154,81 +211,76 @@ bool iproc_probe(target *t)
 
 	// does it have a NAND controller we support? Earlier than rev 6 is untested
 	uint32_t nand_rev = target_mem_read32(t, IPROC_NAND_REVISION);
+	DEBUG("iproc nand_rev=%"PRIx32"\n", nand_rev);
 	if ((/*major rev*/(nand_rev>>8)&0xff) < 6) {
 		DEBUG("iproc nand_rev %"PRIx32" too old\n", nand_rev);
 		return false;
 	}
 
 	uint32_t init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
-	if (!(init_status & (1<</*DEVICE_ID_INIT_DONE*/30))) {
-		DEBUG("iproc no DEV ID\n");
-		return false;
-	}
-
-	//uint32_t nand_dev_id = target_mem_read32(t, IPROC_NAND_FLASH_DEVICE_ID);
-	//DEBUG("iproc_probe nand_dev_id=%"PRIx32"\n", nand_dev_id);
+	DEBUG("iproc nand init_status=%"PRIx32"\n", init_status);
 
 	// does the NAND device support ONFI? non-ONFI is not supported, though it could be if someone wanted it
-	// ONFI is just a convenient way to get hold of the NAND device's page/oob/block sizes
+	// ONFI is just a convenient way to get hold of the NAND device's page/oob/block sizes. Otherwise they'd
+	// have to look at IPROC_NAND_FLASH_DEVICE_ID and have a table of known NAND devices.
 	uint32_t onfi_status = target_mem_read32(t, IPROC_NAND_ONFI_STATUS);
-	DEBUG("iproc_probe init_status=%"PRIx32", onfi_status=%"PRIx32"\n", init_status, onfi_status);
+	DEBUG("iproc nand onfi_status=%"PRIx32"\n", onfi_status);
 	if (!(init_status & (1<</*ONFI_INIT_DONE*/31)) || !(onfi_status & (1<</*ONFI_detected*/27))) {
 		DEBUG("iproc no ONFI\n");
+		// NOTE: should someone someday need to support NANDs which don't implement ONFI they'll have to set up the timing
+		// and parameter registers themselves, using what they know about the NAND given its' device ID.
 		return false;
 	}
 
 	// target seems usable
 
-	/*
+	t->driver = "iproc";
+	target_add_commands(t, iproc_cmd_list, "iproc");
+	target_add_ram(t, 0x0, 256<<20);
+
 	if (!iproc_watchdog_disable(t)) {
 		DEBUG("Unable to disable iproc watchdog\n");
 		// and continue anyway
 	}
-	*/
 
-	t->driver = "iproc";
-	//target_add_commands(t, iproc_cmd_list, "iproc");
-	//target_add_ram(t, 0x0, 256<<20);
-
-	// read NAND sizes from ONFI data
+	// read NAND sizes from ONFI-derived data
 	onfi_status &= ~(0xf<<28);
+
+#ifdef ENABLE_DEBUG
+	// dump the ONFI-derived data registers
 	for (uint32_t i=0;i<8;i++) {
 		target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (i<<28));
 		uint32_t x = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
 		DEBUG("ONFI[%"PRIu32"] %"PRIx32"\n", i, x);
 	}
+#endif
 
-	// TODO remove HACK
-	return true;
-
-	/*
 	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (2<<28));
-	uint32_t bytes_per_page = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
-	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (3<<28));
-	uint32_t row_col_size = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
+	uint32_t bytes_per_page = target_mem_read32(t, IPROC_NAND_ONFI_DATA); // for example: 2048
 	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (4<<28));
-	uint32_t blocks_per_lun = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
+	uint32_t blocks_per_lun = target_mem_read32(t, IPROC_NAND_ONFI_DATA); // for example: 2048 again
 	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (5<<28));
-	uint32_t pages_per_blocks = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
-	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (6<<28));
-	uint32_t page_and_block_size = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
-	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (7<<28));
-	uint32_t device_size = target_mem_read32(t, IPROC_NAND_ONFI_DATA);
-	*/
+	uint32_t pages_per_block = target_mem_read32(t, IPROC_NAND_ONFI_DATA); // for example: 64
 	
-	uint32_t pagesize = 2048;
-	uint32_t blocksize = pagesize *64;
-	uint32_t totalsize = blocksize * 2048;
+	uint32_t blocksize = bytes_per_page * pages_per_block;
+	uint64_t totalsize = (uint64_t)blocksize * (uint64_t)blocks_per_lun; // NOTE: iproc seems to assume one LUN. should someone need to support more they'll have to read the onfi parameters directly from the NAND, rather than relying on the iproc nand controller's interpretation of the ONFI parameters
+	DEBUG("%"PRIu64"MB NAND with %"PRIu32" blocks of %"PRIu32"kB, each containing %"PRIu32" pages of %"PRIu32" bytes\n", totalsize>>20, blocks_per_lun, blocksize>>10, pages_per_block, bytes_per_page);
+
+	// clamp totalsize at whatever size_t can hold
+	if (totalsize != (uint64_t)(size_t)totalsize) {
+		totalsize = (size_t)~(uint64_t)0;
+		DEBUG("totalsize clamped to %"PRIu64"MB\n", totalsize>>20);
+	}
 
 	struct target_flash* f = calloc(1, sizeof(*f));
 	f->start = 0; // TODO figure out where we should pretend the NAND lives
-	f->length = totalsize;
+	f->length = (size_t)totalsize;
 	f->blocksize = blocksize;
 	f->erase = iproc_flash_erase;
 	f->write = target_flash_write_buffered;
 	f->done = target_flash_done_buffered;
 	f->erased = 0xff;
-	f->buf_size = 512;
+	f->buf_size = 512; // AFAICT the iproc nand controller assumes a 512 byte sub-page write
 	f->write_buf = iproc_flash_write;
 	target_add_flash(t, f);
 

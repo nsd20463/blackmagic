@@ -218,9 +218,11 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 	target *t = f->t;
 	addr -= f->start;
 
+	DEBUG("iproc erase %u at %"PRIx32"\n", (unsigned int)len, addr);
+
 	// if addr or len are not block aligned then consider the caller to be confused
 	if (addr & (f->blocksize-1) || len & (f->blocksize-1)) {
-		tc_printf(t, "flash erase addr/len %u/%zu is not block aligned\n", (unsigned int)addr, len);
+		tc_printf(t, "flash erase addr/len %u/%u is not block aligned\n", (unsigned int)addr, (unsigned int)len);
 		return -1;
 	}
 
@@ -268,17 +270,17 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest, const voi
 	target *t = f->t;
 	dest -= f->start;
 
-	DEBUG("iproc write %zu at %"PRIx32"\n", len, dest);
+	DEBUG("iproc write %u at %"PRIx32"\n", (unsigned int)len, dest);
 
 	// if dest or len are not sub-page aligned then consider the caller to be confused
 	if (dest & (IPROC_SUBPAGE_SIZE-1) || len & (IPROC_SUBPAGE_SIZE-1)) {
-		tc_printf(t, "flash erase addr/len %u/%zu is not %d-byte sub-page aligned\n", (unsigned int)dest, len, IPROC_SUBPAGE_SIZE);
+		tc_printf(t, "flash erase addr/len %u/%u is not %d-byte sub-page aligned\n", (unsigned int)dest, (unsigned int)len, IPROC_SUBPAGE_SIZE);
 		return -1;
 	}
 
 	bool first = true;
 	while ((ssize_t)len > 0) {
-		DEBUG("iproc write at %"PRIx32"\n", dest);
+		DEBUG("iproc write sub-page at %"PRIx32"\n", dest);
 
 		if (first || (dest & (f->blocksize-1)) == 0) {
 			first = false;

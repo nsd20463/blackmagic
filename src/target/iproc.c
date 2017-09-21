@@ -28,22 +28,24 @@
 
 #define IPROC_CCA_CHIPID 0x18000000
 #define IPROC_CCA_NAND 0x18026000 // base of NAND controller
+#define IPROC_CCA_IDM 0x18100000 // base of IDM registers
 #define IPROC_CCB_WATCHDOG 0x18039000 // base of watchdog
 
+// watchdog
 #define IPROC_CCB_WDT_WDOGCONTROL (IPROC_CCB_WATCHDOG+0x8)
 #define IPROC_CCB_WDT_WDOGLOCK (IPROC_CCB_WATCHDOG+0xc00)
 #define IPROC_CCB_WDT_UNLOCK_CODE 0x1ACCE551
 #define IPROC_CCB_WDT_WDOGPERIPHID(n) (IPROC_CCB_WATCHDOG+0xfe0+4*(n))
 #define IPROC_CCB_WDT_WDOGPCELLID(n)  (IPROC_CCB_WATCHDOG+0xff0+4*(n))
 
+// NAND controller
 #define IPROC_NAND_REVISION (IPROC_CCA_NAND+0x0)
 #define IPROC_NAND_CMD_START (IPROC_CCA_NAND+0x4)
 #define IPROC_NAND_EXT_ADDRESS (IPROC_CCA_NAND+0x8)
 #define IPROC_NAND_ADDRESS (IPROC_CCA_NAND+0xc)
 #define IPROC_NAND_END_ADDRESS (IPROC_CCA_NAND+0x10)
-#define IPROC_NAND_END_ADDRESS (IPROC_CCA_NAND+0x10)
 #define IPROC_NAND_INTFC_STATUS (IPROC_CCA_NAND+0x14)
-#define IPROC_NAND_SELECT (IPROC_CCA_NAND+0x18)
+#define IPROC_NAND_CS_NAND_SELECT (IPROC_CCA_NAND+0x18)
 #define IPROC_NAND_ACC_CONTROL_CS(cs) (IPROC_CCA_NAND+0x50+0x10*(cs))
 #define IPROC_NAND_CONFIG_CS(cs) (IPROC_CCA_NAND+0x54+0x10*(cs))
 #define IPROC_NAND_TIMING_1_CS(cs) (IPROC_CCA_NAND+0x58+0x10*(cs))
@@ -65,6 +67,23 @@
 #define IPROC_NAND_nand_rb_b (IPROC_CCA_NAND+0xf14)
 #define IPROC_NAND_ecc_uncorr (IPROC_CCA_NAND+0xf18)
 #define IPROC_NAND_ecc_corr (IPROC_CCA_NAND+0xf1c)
+
+#define IPROC_IDM_NAND_IO_CONTROL_DIRECT (IPROC_CCA_IDM+0x1b408)
+#define IPROC_IDM_NAND_RESET_CONTROL (IPROC_CCA_IDM+0x1b800)
+
+// values for IPROC_NAND_CMD_START[28:24]
+#define IPROC_NAND_OPCODE_PAGE_READ 1
+#define IPROC_NAND_OPCODE_SPARE_AREA_READ 2
+#define IPROC_NAND_OPCODE_STATUS_READ 3
+#define IPROC_NAND_OPCODE_PROGRAM_PAGE 4
+#define IPROC_NAND_OPCODE_PROGRAM_SPARE_AREA 5
+#define IPROC_NAND_OPCODE_DEVICE_ID_READ 7
+#define IPROC_NAND_OPCODE_BLOCK_ERASE 8
+#define IPROC_NAND_OPCODE_FLASH_RESET 9
+#define IPROC_NAND_OPCODE_BLOCKS_LOCK 10
+#define IPROC_NAND_OPCODE_BLOCKS_LOCK_DOWN 11
+#define IPROC_NAND_OPCODE_BLOCKS_UNLOCK 12
+#define IPROC_NAND_OPCODE_READ_BLOCK_LOCK_STATUS 13
 
 static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t len)
 {
@@ -96,16 +115,55 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest,
 }
 
 static int iproc_flash_read(struct target_flash *f, void *dst,
-                             target_addr dest, size_t len)
+                             target_addr src, size_t len)
 {
 	target *t = f->t;
-	int rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), len);
-	if (rc)
-		return rc;
+	src += f->start;
 
-	dest -= f->start;
+	// zero the uncorrectable ECC error counter
+	target_mem_write32(t, IPROC_NAND_UNCORR_ERROR_COUNT, 0);
 
-	DEBUG("pretend iproc read %zu at %"PRIx32"\n", len, dest);
+	// disable cache hits when reading the first subpage. we don't need them
+	uint32_t acc_ctrl = target_mem_read32(t, IPROC_NAND_ACC_CONTROL_CS(0));
+	DEBUG("acc_ctrl %"PRIx32"\n", acc_ctrl);
+	acc_ctrl &= ~(/*PAGE_HIT_EN*/1<<24);
+	target_mem_write32(t, IPROC_NAND_ACC_CONTROL_CS(0), acc_ctrl);
+
+	while (len) {
+		target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
+		target_mem_write32(t, IPROC_NAND_ADDRESS, src);
+		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PAGE_READ<<24);
+		uint32_t st;
+		while (true) {
+			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+			if (st & (/*CTRL_READY*/1<<31))
+				break;
+		}
+
+		// copy out the data even if ECC failed
+		size_t n = len;
+		if (n > 512)
+			n = 512;
+		int rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), len);
+		if (rc)
+			return rc;
+
+		// check for uncorrectable errors?
+		// these most often happen in erased pages with bit flips, since iproc nand controller doesn't correct these
+		// (the designers failed to make the ECC value of an erased page be 0xfff)
+		uint32_t uncorr = target_mem_read32(t, IPROC_NAND_UNCORR_ERROR_COUNT);
+		DEBUG("uncorr %"PRIu32"\n", uncorr);
+		if (uncorr != 0) {
+			//return -2;
+		}
+
+		if (!(st & (/*CACHE_VALID*/1<<29))) {
+			//return -1;
+		}
+
+		dst = (char*)dst + n;
+		len -= n;
+	}
 
 	return 0;
 }
@@ -176,10 +234,10 @@ bool iproc_watchdog_disable(target *t)
 	uint32_t x;
 	for (int i=0; i<4; i++) {
 		x = target_mem_read32(t, IPROC_CCB_WDT_WDOGPCELLID(i));
-		if ((x & 0xff) != expected_cellid[i]) 
+		if ((x & 0xff) != expected_cellid[i])
 			return false;
 		x = target_mem_read32(t, IPROC_CCB_WDT_WDOGPERIPHID(i));
-		if ((x & 0xff) != expected_periphid[i]) 
+		if ((x & 0xff) != expected_periphid[i])
 			return false;
 	}
 
@@ -209,6 +267,25 @@ bool iproc_probe(target *t)
 		return false;
 	}
 
+	// do we need to reset the NAND controller and force it to reconfigure itself via ONFI?
+	// it might be a good idea if firmware left the NAND in a strange state.
+
+	// reset the NAND controller
+	target_mem_write32(t, IPROC_IDM_NAND_RESET_CONTROL, 1);
+	platform_delay(1);
+	target_mem_write32(t, IPROC_IDM_NAND_RESET_CONTROL, 0);
+	platform_delay(1);
+	uint32_t reset_ctrl = target_mem_read32(t, IPROC_IDM_NAND_RESET_CONTROL);
+	DEBUG("iproc reset_ctrl=%"PRIx32"\n", reset_ctrl);
+	if (reset_ctrl != 0) {
+		DEBUG("iproc nand stuck in reset\n");
+		return false;
+	}
+
+	// configure the NAND controller's APB and AXI interfaces
+	// we run them in their default endiannesses and fix it up in software here
+	target_mem_write32(t, IPROC_IDM_NAND_IO_CONTROL_DIRECT, (/*clk_enable*/1<<0));
+
 	// does it have a NAND controller we support? Earlier than rev 6 is untested
 	uint32_t nand_rev = target_mem_read32(t, IPROC_NAND_REVISION);
 	DEBUG("iproc nand_rev=%"PRIx32"\n", nand_rev);
@@ -217,8 +294,26 @@ bool iproc_probe(target *t)
 		return false;
 	}
 
+	// and re-init the NAND controller
+	uint32_t cs_nand_sel = target_mem_read32(t, IPROC_NAND_CS_NAND_SELECT);
+	DEBUG("iproc cs_nand_sel=%"PRIx32"\n", cs_nand_sel);
+	cs_nand_sel &= ~(/*DIRECT_ACCESS*/0xff<<0); // disable memory mapped NAND, so we can use the NAND controller
+	cs_nand_sel &= ~((/*AUTO_DEVICE_ID_CONFIG*/1<<30)+(/*NAND_WP*/1<<29)+(/*WR_PROTECT_BLK0*/1<<28));
+	target_mem_write32(t, IPROC_NAND_CS_NAND_SELECT, cs_nand_sel);
+	cs_nand_sel |= (/*AUTO_DEVICE_ID_CONFIG*/1<<30);
+	target_mem_write32(t, IPROC_NAND_CS_NAND_SELECT, cs_nand_sel);
+
+	// give the NAND 1 second to initialize itself
 	uint32_t init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
+	while (!(init_status & (/*INIT_SUCCESS,FAIL,BLANK,TIMEOUT,UNC_ERROR,CORR_ERROR,PARAMETER_READY,AUTHENTICATION_FAIL*/0xff<<22))) {
+		init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
+	}
 	DEBUG("iproc nand init_status=%"PRIx32"\n", init_status);
+
+	if (!(init_status & (/*INIT_SUCCESS*/1<<29))) {
+		DEBUG("iproc NAND init failure, %"PRIx32"\n", init_status);
+		return false;
+	}
 
 	// does the NAND device support ONFI? non-ONFI is not supported, though it could be if someone wanted it
 	// ONFI is just a convenient way to get hold of the NAND device's page/oob/block sizes. Otherwise they'd
@@ -232,11 +327,9 @@ bool iproc_probe(target *t)
 		return false;
 	}
 
-	// target seems usable
-
-	t->driver = "iproc";
-	target_add_commands(t, iproc_cmd_list, "iproc");
-	target_add_ram(t, 0x0, 256<<20);
+	// configure for ONFI timing mode 0 (the slowest)
+	target_mem_write32(t, IPROC_NAND_TIMING_1_CS(0), 0xd8d8558d);
+	target_mem_write32(t, IPROC_NAND_TIMING_2_CS(0), 0x00000c83);
 
 	if (!iproc_watchdog_disable(t)) {
 		DEBUG("Unable to disable iproc watchdog\n");
@@ -261,7 +354,7 @@ bool iproc_probe(target *t)
 	uint32_t blocks_per_lun = target_mem_read32(t, IPROC_NAND_ONFI_DATA); // for example: 2048 again
 	target_mem_write32(t, IPROC_NAND_ONFI_STATUS, onfi_status | (5<<28));
 	uint32_t pages_per_block = target_mem_read32(t, IPROC_NAND_ONFI_DATA); // for example: 64
-	
+
 	uint32_t blocksize = bytes_per_page * pages_per_block;
 	uint64_t totalsize = (uint64_t)blocksize * (uint64_t)blocks_per_lun; // NOTE: iproc seems to assume one LUN. should someone need to support more they'll have to read the onfi parameters directly from the NAND, rather than relying on the iproc nand controller's interpretation of the ONFI parameters
 	DEBUG("%"PRIu64"MB NAND with %"PRIu32" blocks of %"PRIu32"kB, each containing %"PRIu32" pages of %"PRIu32" bytes\n", totalsize>>20, blocks_per_lun, blocksize>>10, pages_per_block, bytes_per_page);
@@ -282,6 +375,10 @@ bool iproc_probe(target *t)
 	f->erased = 0xff;
 	f->buf_size = 512; // AFAICT the iproc nand controller assumes a 512 byte sub-page write
 	f->write_buf = iproc_flash_write;
+
+	t->driver = "iproc";
+	target_add_commands(t, iproc_cmd_list, "iproc");
+	target_add_ram(t, 0x0, 256<<20);
 	target_add_flash(t, f);
 
 	return true;

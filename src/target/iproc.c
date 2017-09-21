@@ -192,9 +192,21 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest,
 	return 0;
 }
 
+// swap the endianess of uint32_t in a potentially misaligned buffer
+static void uint32_endianess_swap(uint8_t *buf, size_t len)
+{
+	for (size_t i=0; i+3<n; i+=4) {
+		uint8_t x[4] = { dst[i+3], dst[i+2], dst[i+1], dst[i] };
+		buf[i] = x[0];
+		buf[i+1] = x[1];
+		buf[i+2] = x[2];
+		buf[i+3] = x[3];
+	}
+}
+
 // read from the flash. src ought to be nand-page aligned
 static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
-                             target_addr src, size_t len)
+                             target_addr src, size_t len, uint8_t *spare)
 {
 	target *t = f->t;
 	src -= f->start;
@@ -230,12 +242,13 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
 			return rc;
 
 		// fix endianess of data we just read. it arrives as big-endian uint32_t
-		for (int i=0; i<512; i+=4) {
-			uint8_t x[4] = { dst[i+3], dst[i+2], dst[i+1], dst[i] };
-			dst[i] = x[0];
-			dst[i+1] = x[1];
-			dst[i+2] = x[2];
-			dst[i+3] = x[3];
+		uint32_endianess_swap(dst, n);
+
+		if (spare) {
+			rc = target_mem_read(t, spare, IPROC_NAND_SPARE_AREA_READ(0), 64);
+			if (rc)
+				return rc;
+			uint32_endianess_swap(spare, 64);
 		}
 
 		// check for uncorrectable errors?
@@ -251,7 +264,10 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
 			//return -1;
 		}
 
+		src += n;
 		dst += n;
+		if (spare)
+			spare += 64;
 		len -= n;
 	}
 
@@ -289,20 +305,34 @@ static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 	}
 
 	const int page_size = 2048;
-	uint8_t buf[page_size];
-	memset(buf, 0xff, page_size);
-	int rc = iproc_flash_read(f, buf, (target_addr)pagenum * page_size, page_size);
+	const int spare_size = 64;
+	uint8_t buf[page_size+spare_size];
+	memset(buf, 0xff, sizeof(buf));
+	int rc = iproc_flash_read(f, buf, (target_addr)pagenum * page_size, page_size, buf+page_size);
 	if (rc) {
 		tc_printf(t, "read failed: %d\n", rc);
 		return false;
 	}
 
-	tc_printf(t, "NAND page %lu\n", pagenum);
+	tc_printf(t, "NAND page %lu:\n", pagenum);
 	for (int i=0; i<page_size; i+=16) {
 		tc_printf(t, "%03x: ", i);
 		for (int j=0; j<16; j++) {
 			uint8_t x = buf[i+j];
 			tc_printf(t, "%02x ", x);
+			if (i == 8)
+				tc_printf(t, " ");
+		}
+		tc_printf(t, "\n");
+	}
+	tc_printf(t, "spare/ECC bytes:\n");
+	for (int i=0; i<spare_size; i+=16) {
+		tc_printf(t, "%02x: ", i);
+		for (int j=0; j<16; j++) {
+			uint8_t x = buf[page_size+i+j];
+			tc_printf(t, "%02x ", x);
+			if (i == 8)
+				tc_printf(t, " ");
 		}
 		tc_printf(t, "\n");
 	}

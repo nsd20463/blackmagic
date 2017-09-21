@@ -179,26 +179,30 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst, target_addr sr
 }
 
 // return true if the block at offset addr is marked as bad
-// in ONFI a bad marker is when the first or last pages' spare area has an all-0 byte
-// such blocks must not be erased or written
 static bool iproc_is_bad_block(struct target_flash *f, target_addr addr)
 {
 	const int page_size = f->pagesize;
 	const int spare_size = page_size / IPROC_SUBPAGE_SIZE * IPROC_SUBPAGE_SPARE_SIZE;
 	uint8_t buf[spare_size];
 
-	// check the spare area of the first and last pages of the block
+	// ONFI spec says the block is bad if any of the spare area bytes of the first or
+	// last page are 0x00. However ECC uses some of those bytes, and might have written
+	// 0x00 legitimately. (ONFI's idea is that you're going to read the ONFI bad block
+	// markers only once, and store them elsewhere in a data structure you persist
+	// redudantly, so the trouble doesn't occur, but we wouldn't know where that
+	// data structure was and how to interpret it)
+	// Linux works around this by checking only the first byte of the spare areas,
+	// rather than the entire area (NAND_LARGE_BADBLOCK_POS). (Linux also considers
+	// the block bad if any bit is 0). That avoids the ECC bytes since ECC starts
+	// at the 3rd byte.
 	for (int j=0; j < 2; j++, addr += f->blocksize - page_size) {
 		memset(buf, 0xff, sizeof(buf));
 		int rc = iproc_flash_read(f, NULL, addr, page_size, buf);
 		if (rc)
 			return true; // better to be safe
 
-		for (int i=0; i<spare_size; i++) {
-			if (buf[i] == 0) {
-				// ONFI bad block marker
-				return true;
-			}
+		if (buf[0] != 0xff) { // same check as linux
+			return true;
 		}
 	}
 

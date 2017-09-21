@@ -31,6 +31,9 @@
 #define IPROC_SUBPAGE_SPARE_SIZE 64 // max size of spare bytes for each subpage
 #define IPROC_NAND_WINDOW 0x1c000000 // physical address where an image of NAND appears when in boot mode and CPU is strapped to boot from NAND
 
+// hardcode things which might need to change for new u-boot software
+#define UBOOT_SPL_TEXT_ADDR 0x50000000 // where the NAND is mapped after booting. actually the NAND is mapped elsehwere, and this is where the copy in L2 cache is put, but for gdb 'load' to work out this needs to be the link address of the SPL elf executable
+
 #define IPROC_CCA_CHIPID 0x18000000
 #define IPROC_CCA_NAND 0x18026000 // base of NAND controller
 #define IPROC_CCA_IDM 0x18100000 // base of IDM registers
@@ -106,10 +109,10 @@ static void uint32_endianess_swap(uint8_t *buf, size_t len)
 
 // read from the flash. src ought to be nand-page aligned
 // if spare is non-NULL then the spare area is also read. there needs to be 64*num-subpages-per-page
-static int iproc_flash_read(struct target_flash *f, uint8_t *dst, target_addr src, size_t len, uint8_t *spare)
+// NOTE the source argument is the byte offset from the base of flash, NOT a memory address
+static int iproc_flash_read(struct target_flash *f, uint8_t *dst, uint32_t offset, size_t len, uint8_t *spare)
 {
 	target *t = f->t;
-	src -= f->start;
 
 	// zero the uncorrectable ECC error counter
 	target_mem_write32(t, IPROC_NAND_UNCORR_ERROR_COUNT, 0);
@@ -122,7 +125,7 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst, target_addr sr
 
 	while ((ssize_t)len > 0) {
 		target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
-		target_mem_write32(t, IPROC_NAND_ADDRESS, src);
+		target_mem_write32(t, IPROC_NAND_ADDRESS, offset);
 		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PAGE_READ<<24);
 
 		// wait for controller to be done
@@ -167,7 +170,7 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst, target_addr sr
 			//return -1;
 		}
 
-		src += n;
+		offset += n;
 		if (dst)
 			dst += n;
 		if (spare)
@@ -178,8 +181,9 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst, target_addr sr
 	return 0;
 }
 
-// return true if the block at offset addr is marked as bad
-static bool iproc_is_bad_block(struct target_flash *f, target_addr addr)
+// return true if the block at offset is marked as bad
+// NOTE the source argument is the byte offset from the base of flash, NOT a memory address
+static bool iproc_is_bad_block(struct target_flash *f, target_addr offset)
 {
 	const int page_size = f->pagesize;
 	const int spare_size = page_size / IPROC_SUBPAGE_SIZE * IPROC_SUBPAGE_SPARE_SIZE;
@@ -195,9 +199,9 @@ static bool iproc_is_bad_block(struct target_flash *f, target_addr addr)
 	// rather than the entire area (NAND_LARGE_BADBLOCK_POS). (Linux also considers
 	// the block bad if any bit is 0). That avoids the ECC bytes since ECC starts
 	// at the 3rd byte.
-	for (int j=0; j < 2; j++, addr += f->blocksize - page_size) {
+	for (int j=0; j < 2; j++, offset += f->blocksize - page_size) {
 		memset(buf, 0xff, sizeof(buf));
-		int rc = iproc_flash_read(f, NULL, addr, page_size, buf);
+		int rc = iproc_flash_read(f, NULL, offset, page_size, buf);
 		if (rc)
 			return true; // better to be safe
 
@@ -259,8 +263,7 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 	return 0;
 }
 
-static int iproc_flash_write(struct target_flash *f, target_addr dest,
-                             const void *src, size_t len)
+static int iproc_flash_write(struct target_flash *f, target_addr dest, const void *src, size_t len)
 {
 	target *t = f->t;
 	dest -= f->start;
@@ -549,7 +552,7 @@ bool iproc_probe(target *t)
 	}
 
 	struct target_flash* f = calloc(1, sizeof(*f));
-	f->start = 0; // TODO figure out where we should pretend the NAND lives
+	f->start = UBOOT_SPL_TEXT_ADDR;
 	f->length = (size_t)totalsize;
 	f->blocksize = blocksize;
 	f->pagesize = bytes_per_page;

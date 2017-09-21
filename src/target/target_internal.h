@@ -39,6 +39,7 @@ struct target_flash {
 	target_addr start;
 	size_t length;
 	size_t blocksize;
+	size_t pagesize;
 	flash_erase_func erase;
 	flash_write_func write;
 	flash_done_func done;

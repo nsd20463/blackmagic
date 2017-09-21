@@ -60,7 +60,9 @@
 #define IPROC_NAND_ONFI_DATA (IPROC_CCA_NAND+0x14c)
 #define IPROC_NAND_FLASH_DEVICE_ID (IPROC_CCA_NAND+0x194)
 #define IPROC_NAND_FLASH_DEVICE_ID_EXT (IPROC_CCA_NAND+0x198)
-#define IPROC_NAND_FLASH_CACHE(n) (IPROC_CCA_NAND+0x400+4*(n)) // 0 <= n <= 127, for a 512 byte sub-page (but complete ECC block) cache
+#define IPROC_NAND_SPARE_AREA_READ(n) (IPROC_CCA_NAND+0x200+4*(n)) // 0 <= n <= 15, for a max of 64 bytes spare area
+#define IPROC_NAND_SPARE_AREA_WRITE(n) (IPROC_CCA_NAND+0x280+4*(n)) // <same>
+#define IPROC_NAND_FLASH_CACHE(n) (IPROC_CCA_NAND+0x400+4*(n)) // 0 <= n <= 127, for a 512 byte sub-page (ECC block) cache
 #define IPROC_NAND_block_erase_complete (IPROC_CCA_NAND+0xf04)
 #define IPROC_NAND_program_page_complete (IPROC_CCA_NAND+0xf0c)
 #define IPROC_NAND_ro_ctlr_ready (IPROC_CCA_NAND+0xf10)
@@ -87,11 +89,41 @@
 
 static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t len)
 {
-	//target *t = f->t;
+	target *t = f->t;
 	addr -= f->start;
-	while (len) {
+
+	// if addr or len are not block aligned then consider the caller to be confused
+	if (addr & (f->blocksize-1) || len & (f->blocksize-1)) {
+		tc_printf(t, "flash erase addr/len %u/%zu is not block aligned\n", (unsigned int)addr, len);
+		return -1;
+	}
+
+	while ((ssize_t)len > 0) {
 		// erase the block at offset 'addr'
-		DEBUG("pretend iproc erase at %"PRIx32"\n", addr);
+		DEBUG("iproc erase at %"PRIx32"\n", addr);
+
+		target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
+		target_mem_write32(t, IPROC_NAND_ADDRESS, addr);
+		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_BLOCK_ERASE<<24);
+
+		// wait for controller to be done
+		uint32_t st = 0;
+		while (!(st & (/*CTRL_READY*/1<<31))) {
+			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+		}
+		DEBUG("iproc erase status %"PRIx32"\n", st);
+
+		if (st & (!(/*WP#*/1<<7))) {
+			// write-protect is enabled. possible if there is an external circuit
+			tc_printf(t, "NAND is write-protected\n");
+			return -1;
+		}
+
+		if (st & (/*FAIL*/1<<0)) {
+			tc_printf(t, "NAND erase at %u failed\n", (unsigned int)addr);
+			return -1;
+		}
+
 		addr += f->blocksize;
 		len -= f->blocksize;
 	}
@@ -103,22 +135,69 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest,
                              const void *src, size_t len)
 {
 	target *t = f->t;
-	int rc = target_mem_write(t, IPROC_NAND_FLASH_CACHE(0), src, len);
-	if (rc)
-		return rc;
-
 	dest -= f->start;
 
-	DEBUG("pretend iproc write %zu at %"PRIx32"\n", len, dest);
+	DEBUG("iproc write %zu at %"PRIx32"\n", len, dest);
+
+	// if dest or len are not sub-page aligned then consider the caller to be confused
+	if (dest & (512-1) || len & (512-1)) {
+		tc_printf(t, "flash erase addr/len %u/%zu is not 512-byte sub-page aligned\n", (unsigned int)dest, len);
+		return -1;
+	}
+
+	while ((ssize_t)len > 0) {
+		DEBUG("iproc write at %"PRIx32"\n", dest);
+
+		// the address needs to be set up before copying into the flash cache
+		target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
+		target_mem_write32(t, IPROC_NAND_ADDRESS, dest);
+
+		// byte-swap each uint32_t as we load it into the controller
+		for (size_t i=0; i<512/4; i++) {
+			uint32_t x;
+			memcpy(&x, src, 4);
+			x = (x>>24) + + ((x >> 8) & 0xff00) + ((x & 0xff00) << 8) + (x<<24);
+			target_mem_write32(t, IPROC_NAND_FLASH_CACHE(i), x);
+		}
+		// the spare bytes are set to 1. the NAND controller will merge in the ECC bits is computes
+		for (size_t i=0; i<16; i++) {
+			target_mem_write32(t, IPROC_NAND_SPARE_AREA_WRITE(i), 0xffffffff);
+		}
+
+		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PROGRAM_PAGE<<24);
+
+		// wait for controller to be done
+		uint32_t st = 0;
+		while (!(st & (/*CTRL_READY*/1<<31))) {
+			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+		}
+		DEBUG("iproc write status %"PRIx32"\n", st);
+
+		if (st & (!(/*WP#*/1<<7))) {
+			// write-protect is enabled. possible if there is an external circuit
+			tc_printf(t, "NAND is write-protected\n");
+			return -1;
+		}
+
+		if (st & (/*FAIL*/1<<0)) {
+			tc_printf(t, "NAND write at %u failed\n", (unsigned int)dest);
+			return -1;
+		}
+
+		src = (const char*)src + 512;
+		dest += 512;
+		len -= 512;
+	}
 
 	return 0;
 }
 
+// read from the flash. src ought to be nand-page aligned
 static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
                              target_addr src, size_t len)
 {
 	target *t = f->t;
-	src += f->start;
+	src -= f->start;
 
 	// zero the uncorrectable ECC error counter
 	target_mem_write32(t, IPROC_NAND_UNCORR_ERROR_COUNT, 0);
@@ -129,10 +208,12 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
 	acc_ctrl &= ~(/*PAGE_HIT_EN*/1<<24);
 	target_mem_write32(t, IPROC_NAND_ACC_CONTROL_CS(0), acc_ctrl);
 
-	while (len) {
+	while ((ssize_t)len > 0) {
 		target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
 		target_mem_write32(t, IPROC_NAND_ADDRESS, src);
 		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PAGE_READ<<24);
+
+		// wait for controller to be done
 		uint32_t st;
 		while (true) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
@@ -144,7 +225,7 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
 		size_t n = len;
 		if (n > 512)
 			n = 512;
-		int rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), len);
+		int rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), n);
 		if (rc)
 			return rc;
 

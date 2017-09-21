@@ -114,7 +114,7 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest,
 	return 0;
 }
 
-static int iproc_flash_read(struct target_flash *f, void *dst,
+static int iproc_flash_read(struct target_flash *f, uint8_t *dst,
                              target_addr src, size_t len)
 {
 	target *t = f->t;
@@ -148,6 +148,15 @@ static int iproc_flash_read(struct target_flash *f, void *dst,
 		if (rc)
 			return rc;
 
+		// fix endianess of data we just read. it arrives as big-endian uint32_t
+		for (int i=0; i<512; i+=4) {
+			uint8_t x[4] = { dst[i+3], dst[i+2], dst[i+1], dst[i] };
+			dst[i] = x[0];
+			dst[i+1] = x[1];
+			dst[i+2] = x[2];
+			dst[i+3] = x[3];
+		}
+
 		// check for uncorrectable errors?
 		// these most often happen in erased pages with bit flips, since iproc nand controller doesn't correct these
 		// (the designers failed to make the ECC value of an erased page be 0xfff)
@@ -161,7 +170,7 @@ static int iproc_flash_read(struct target_flash *f, void *dst,
 			//return -1;
 		}
 
-		dst = (char*)dst + n;
+		dst += n;
 		len -= n;
 	}
 

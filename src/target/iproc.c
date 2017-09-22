@@ -95,15 +95,20 @@
 #define IPROC_NAND_OPCODE_BLOCKS_UNLOCK 12
 #define IPROC_NAND_OPCODE_READ_BLOCK_LOCK_STATUS 13
 
-// swap the endianess of uint32_t in a potentially misaligned buffer
+// convert to/from big-endian uint32
+static inline uint32_t htofrombe_uint32(uint32_t x) {
+	// BMP is little-endian, so swap x's bytes around
+	return (x>>24) + + ((x >> 8) & 0xff00) + ((x & 0xff00) << 8) + (x<<24);
+}
+
+// inplace endianess swap of each uint32_t in a potentially misaligned buffer
 static void uint32_endianess_swap(uint8_t *buf, size_t len)
 {
-	for (size_t i=0; i+3<len; i+=4) {
-		uint8_t x[4] = { buf[i+3], buf[i+2], buf[i+1], buf[i] };
-		buf[i] = x[0];
-		buf[i+1] = x[1];
-		buf[i+2] = x[2];
-		buf[i+3] = x[3];
+	for (size_t i=0; i+3<len; i+=4, buf+=4) {
+		uint32_t x;
+		memcpy(&x, buf, 4);
+		x = htofrombe_uint32(x);
+		memcpy(buf, &x, 4);
 	}
 }
 
@@ -114,10 +119,10 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst, uint32_t offse
 {
 	target *t = f->t;
 
-	// zero the uncorrectable ECC error counter
+	// zero the uncorrectable ECC error counter. unlike the correctable error counter this one doesn't zero itself
 	target_mem_write32(t, IPROC_NAND_UNCORR_ERROR_COUNT, 0);
 
-	// disable cache hits when reading the first subpage. we don't need them
+	// disable cache hits when reading the first subpage. we don't need (or want) them
 	uint32_t acc_ctrl = target_mem_read32(t, IPROC_NAND_ACC_CONTROL_CS(0));
 	DEBUG("acc_ctrl %"PRIx32"\n", acc_ctrl);
 	acc_ctrl &= ~(/*PAGE_HIT_EN*/1<<24);
@@ -161,13 +166,9 @@ static int iproc_flash_read(struct target_flash *f, uint8_t *dst, uint32_t offse
 		// these most often happen in erased pages with bit flips, since iproc nand controller doesn't correct these
 		// (the designers failed to make the ECC value of an erased page be 0xfff)
 		uint32_t uncorr = target_mem_read32(t, IPROC_NAND_UNCORR_ERROR_COUNT);
-		DEBUG("uncorr %"PRIu32"\n", uncorr);
 		if (uncorr != 0) {
-			//return -2;
-		}
-
-		if (!(st & (/*CACHE_VALID*/1<<29))) {
-			//return -1;
+			DEBUG("uncorr %"PRIu32"\n", uncorr);
+			// and continue anyway
 		}
 
 		offset += n;
@@ -300,7 +301,8 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest, const voi
 		for (size_t i=0; i<IPROC_SUBPAGE_SIZE/4; i++) {
 			uint32_t x;
 			memcpy(&x, src, 4);
-			x = (x>>24) + + ((x >> 8) & 0xff00) + ((x & 0xff00) << 8) + (x<<24);
+			src += 4;
+			x = htofrombe_uint32(x);
 			target_mem_write32(t, IPROC_NAND_FLASH_CACHE(i), x);
 		}
 		// the spare bytes are set to 1. the NAND controller will merge in the ECC bits is computes

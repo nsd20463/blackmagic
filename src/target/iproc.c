@@ -426,10 +426,6 @@ static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 	}
 
 	tc_printf(t, "NAND page %lu:\n", pagenum);
-	if (errors[0])
-		tc_printf(t, "%"PRIu32" ECC-corrected bit errors\n", errors[0]);
-	if (errors[1])
-		tc_printf(t, "***** ECC REPORTS UNCORRECTABLE BIT ERRORS *****\n"); // note the exact number is not known. the hardware counter just counts subpages with uncorrectable errors
 	for (int i=0; i<page_size; i+=16) {
 		tc_printf(t, "%03x: ", i);
 		for (int j=0; j<16; j++) {
@@ -451,6 +447,10 @@ static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 		}
 		tc_printf(t, "\n");
 	}
+	if (errors[0])
+		tc_printf(t, "%"PRIu32" ECC-corrected bit errors\n", errors[0]);
+	if (errors[1])
+		tc_printf(t, "***** ECC REPORTS UNCORRECTABLE BIT ERRORS *****\n"); // note the exact number is not known. the hardware counter just counts subpages with uncorrectable errors
 
 	return true;
 }

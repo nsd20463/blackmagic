@@ -135,7 +135,6 @@ static int iproc_flash_read(struct target_flash *f, uint32_t errors[2], uint8_t 
 	// disable cache hits when reading the first subpage. we don't need (or want) them
 	// note if we wanted more speed in the future we could re-enable the page cache after the first subpage
 	uint32_t acc_ctrl = target_mem_read32(t, IPROC_NAND_ACC_CONTROL_CS(0));
-	DEBUG("acc_ctrl %"PRIx32"\n", acc_ctrl);
 	acc_ctrl &= ~(/*PAGE_HIT_EN*/1<<24);
 	target_mem_write32(t, IPROC_NAND_ACC_CONTROL_CS(0), acc_ctrl);
 
@@ -237,7 +236,7 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 
 	while ((ssize_t)len > 0) {
 		// erase the block at offset 'addr'
-		DEBUG("iproc erase at %"PRIx32"\n", addr);
+		DEBUG("iproc erase block at %"PRIx32"\n", addr);
 
 		if (iproc_is_bad_block(f, addr)) {
 			DEBUG("skipping bad block %u\n", (unsigned int)addr);
@@ -254,7 +253,6 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 		while (!(st & (/*CTRL_READY*/1<<31))) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
 		}
-		DEBUG("iproc erase status %"PRIx32"\n", st);
 
 		if (st & (!(/*WP#*/1<<7))) {
 			// write-protect is enabled. possible if there is an external circuit
@@ -263,7 +261,7 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 		}
 
 		if (st & (/*FAIL*/1<<0)) {
-			tc_printf(t, "NAND erase at %u failed\n", (unsigned int)addr);
+			tc_printf(t, "NAND erase block at %u failed\n", (unsigned int)addr);
 			return -1;
 		}
 
@@ -293,15 +291,11 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest, const voi
 	// determines the block cannot be successfully erased or written). We must refuse to write to a bad block, because doing so might erase the bad
 	// block marker.
 	//
-	// Secondly, gdb doesn't erase flash before writing to it. gdb provides an 'erase-flash' command which BMP translates into erasing all flash.
-	// That's way too much erasing for a large NAND device. In addition modern NANDs are picky about writes. They typically specify that writes
+	// Secondly, although gdb does erase flash before writing to it, modern NANDs are picky about writes. They typically specify that writes
 	// within a page and writes within a block *must* be in address order. That is, subpage 0 of page 0 must be the first data written in a block,
 	// followed by subpage 1 of page 0, etc... . And data must only be written one time between block erasures. In my experience nothing dramatically
 	// goes wrong if you don't follow these rules, just the reliability is reduced. Remember that modern NANDs are so close to the reliability limit
 	// that they suffer from read-disturbances (where reading byte X occasionally disturbs a bit in byte Y, where Y can be in a different page than X)
-	//
-	// In order to comply with all this the iproc_flash_write erases NAND blocks as it goes along. And as a concequence of that you must begin
-	// NAND writes on block boundaries. The erase is done before we arrive in this code, by the iproc_flash_write_buffered() function.
 	//
 	// Note that handling bad blocks would require altering the generic buffered flash code, since it would have to accept the adjusted dest as a return
 	// parameter.
@@ -344,7 +338,6 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest, const voi
 		while (!(st & (/*CTRL_READY*/1<<31))) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
 		}
-		DEBUG("iproc write status %"PRIx32"\n", st);
 
 		if (st & (!(/*WP#*/1<<7))) {
 			// write-protect is enabled. possible if there is an external circuit
@@ -363,25 +356,6 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest, const voi
 	}
 
 	return 0;
-}
-
-int iproc_flash_write_buffered(struct target_flash *f, target_addr dest, const void *src, size_t len)
-{
-	target_addr addr = dest - f->start;
-
-	// erase the NAND block(s) we're going to write. For this, the destination must be block-aligned
-	// (see comment in iproc_flash_write)
-	if (addr & (f->blocksize-1)) {
-		tc_printf(f->t, "flash write offset %u is not block aligned\n", (unsigned int)addr);
-		return -1;
-	}
-
-	size_t len2 = (len + f->blocksize-1) & ~(f->blocksize-1); // erase rounds up to the block size
-	int rc = iproc_flash_erase(f, dest, len2);
-	if (rc)
-		return rc;
-
-	return target_flash_write_buffered(f, dest, src, len);
 }
 
 static bool iproc_cmd_id_hw(target *t)
@@ -431,7 +405,7 @@ static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 		for (int j=0; j<16; j++) {
 			uint8_t x = buf[i+j];
 			tc_printf(t, "%02x ", x);
-			if (j == 8)
+			if (j == 7)
 				tc_printf(t, " ");
 		}
 		tc_printf(t, "\n");
@@ -442,7 +416,7 @@ static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 		for (int j=0; j<16; j++) {
 			uint8_t x = buf[page_size+i+j];
 			tc_printf(t, "%02x ", x);
-			if (j == 8)
+			if (j == 7)
 				tc_printf(t, " ");
 		}
 		tc_printf(t, "\n");
@@ -613,7 +587,7 @@ bool iproc_probe(target *t)
 	f->length = (size_t)totalsize;
 	f->blocksize = blocksize;
 	f->erase = iproc_flash_erase;
-	f->write = iproc_flash_write_buffered;
+	f->write = target_flash_write_buffered;
 	f->done = target_flash_done_buffered;
 	f->erased = 0xff;
 	f->buf_size = IPROC_SUBPAGE_SIZE;

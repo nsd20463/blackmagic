@@ -31,9 +31,6 @@
 #define IPROC_SUBPAGE_SPARE_SIZE 64 // max size of spare bytes for each subpage
 #define IPROC_NAND_WINDOW 0x1c000000 // physical address where an image of NAND appears when in boot mode and CPU is strapped to boot from NAND
 
-// hardcode things which might need to change for new u-boot software
-#define UBOOT_SPL_TEXT_ADDR 0x50000000 // where the NAND is mapped after booting. actually the NAND is mapped elsehwere, and this is where the copy in L2 cache is put, but for gdb 'load' to work out this needs to be the link address of the SPL elf executable
-
 #define IPROC_CCA_CHIPID 0x18000000
 #define IPROC_CCA_NAND 0x18026000 // base of NAND controller
 #define IPROC_CCA_IDM 0x18100000 // base of IDM registers
@@ -583,7 +580,7 @@ bool iproc_probe(target *t)
 	struct iproc_flash* ff = calloc(1, sizeof(*ff));
 	ff->pagesize = bytes_per_page;
 	struct target_flash* f = (struct target_flash*)ff;
-	f->start = UBOOT_SPL_TEXT_ADDR;
+	f->start = IPROC_NAND_WINDOW;
 	f->length = (size_t)totalsize;
 	f->blocksize = blocksize;
 	f->erase = iproc_flash_erase;

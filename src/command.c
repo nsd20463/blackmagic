@@ -219,10 +219,17 @@ bool cmd_swdp_scan(void)
 
 }
 
+static void display_ram_or_flash(target_addr start, size_t len, void *context)
+{
+	gdb_outf("          %s: 0x%"PRIx32" - 0x%"PRIx32"\n", (char*)context, start, start+len-1);
+}
+
 static void display_target(int i, target *t, void *context)
 {
 	(void)context;
 	gdb_outf("%2d   %c  %s\n", i, target_attached(t)?'*':' ', target_driver_name(t));
+	target_foreach_ram(t, display_ram_or_flash, "ram");
+	target_foreach_flash(t, display_ram_or_flash, "flash");
 }
 
 bool cmd_targets(void)

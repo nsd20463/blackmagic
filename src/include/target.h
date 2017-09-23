@@ -35,6 +35,8 @@ int adiv5_swdp_scan(void);
 int jtag_scan(const uint8_t *lrlens);
 
 bool target_foreach(void (*cb)(int i, target *t, void *context), void *context);
+void target_foreach_ram(target *t, void (*cb)(target_addr start, size_t len, void *context), void *context);
+void target_foreach_flash(target *t, void (*cb)(target_addr start, size_t len, void *context), void *context);
 void target_list_free(void);
 
 /* Attach/detach functions */

@@ -50,6 +50,24 @@ bool target_foreach(void (*cb)(int, target *t, void *context), void *context)
 	return target_list != NULL;
 }
 
+void target_foreach_ram(target *t, void (*cb)(target_addr, size_t, void*), void *context)
+{
+	struct target_ram *r = t->ram;
+	while (r) {
+		cb(r->start, r->length, context);
+		r = r->next;
+	}
+}
+
+void target_foreach_flash(target *t, void (*cb)(target_addr, size_t, void*), void *context)
+{
+	struct target_flash *f = t->flash;
+	while (f) {
+		cb(f->start, f->length, context);
+		f = f->next;
+	}
+}
+
 void target_list_free(void)
 {
 	struct target_command_s *tc;

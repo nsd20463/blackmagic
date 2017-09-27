@@ -29,7 +29,16 @@
 // hardcoded things which might need to change for new iproc hardware
 #define IPROC_SUBPAGE_SIZE 512 // nand page are broken into 512 byte subpages, each with its own ECC
 #define IPROC_SUBPAGE_SPARE_SIZE 64 // max size of spare bytes for each subpage
-#define IPROC_NAND_WINDOW 0x1c000000 // physical address where an image of NAND appears when in boot mode and CPU is strapped to boot from NAND
+#define IPROC_NAND_WINDOW 0x1c000000 // physical address where an image of the start of NAND appears when in boot mode and CPU is strapped to boot from NAND
+#define IPROC_NAND_WINDOW_SIZE (32<<20) // size of window (actual NAND can be larger, but only the lower 32MB are mapped by hardware)
+#define IPROC_NOR_WINDOW 0x1e000000 // physical address where an image of the start of NOR appears when in boot mode and the CPU is strapped to boot from NOR (sometimes called QSPI for Quad-SPI, the bus where the NOR is located)
+#define IPROC_NOR_WINDOW_SIZE (32<<20) // size of window (actual NOR can be larger, but only the lower 32MB are mapped by hardware)
+#define IPROC_SRAM_ADDR 0x1b000000 // start address of built-in sratch ram
+#define IPROC_SRAM_SIZE (64<<10)
+#define IPROC_DDR_WINDOW_1 0x00000000 // start address of first (legacy?) DDR window
+#define IPROC_DDR_WINDOW_1_SIZE (128<<20) // size of window (DDR can be smaller or larger)
+#define IPROC_DDR_WINDOW_2 0x60000000 // start address of second DDR window, which maps to the same DDR as WINDOW_1 but has a larger size
+#define IPROC_DDR_WINDOW_2_SIZE (2<<30) // size of window (DDR can be smaller or larger)
 
 #define IPROC_CCA_CHIPID 0x18000000
 #define IPROC_CCA_NAND 0x18026000 // base of NAND controller
@@ -97,6 +106,7 @@ struct iproc_flash {
 	struct target_flash f;
 	size_t pagesize; // learned from ONFI; typically 2048
 	target_addr badblock_offset; // byte offset due to bad blocks found during this write (typically each file written starts at a known page, and skips any bad blocks)
+	bool inited; // true once we've initialized (reconfigured) the NAND interface
 };
 
 // convert to/from big-endian uint32
@@ -116,11 +126,75 @@ static void uint32_endianess_swap(uint8_t *buf, size_t len)
 	}
 }
 
+static int iproc_flash_init(struct target_flash *f)
+{
+	if (((struct iproc_flash*)f)->inited)
+		return 0;
+
+	target *t = f->t;
+
+	// reset the NAND controller
+	target_mem_write32(t, IPROC_IDM_NAND_RESET_CONTROL, 1);
+	platform_delay(1);
+	target_mem_write32(t, IPROC_IDM_NAND_RESET_CONTROL, 0);
+	platform_delay(1);
+	uint32_t reset_ctrl = target_mem_read32(t, IPROC_IDM_NAND_RESET_CONTROL);
+	DEBUG("iproc reset_ctrl=%"PRIx32"\n", reset_ctrl);
+	if (reset_ctrl != 0) {
+		DEBUG("iproc nand stuck in reset\n");
+		return -1;
+	}
+
+	// configure the NAND controller's APB and AXI interfaces
+	// we run them in their default endiannesses and fix it up in software here
+	target_mem_write32(t, IPROC_IDM_NAND_IO_CONTROL_DIRECT, (/*clk_enable*/1<<0));
+
+	// and re-init the NAND controller
+	uint32_t cs_nand_sel = target_mem_read32(t, IPROC_NAND_CS_NAND_SELECT);
+	DEBUG("iproc cs_nand_sel=%"PRIx32"\n", cs_nand_sel);
+	cs_nand_sel &= ~(/*DIRECT_ACCESS*/0xff<<0); // disable memory mapped NAND, so we can use the NAND controller
+	cs_nand_sel &= ~((/*AUTO_DEVICE_ID_CONFIG*/1<<30)+(/*NAND_WP*/1<<29)+(/*WR_PROTECT_BLK0*/1<<28));
+	target_mem_write32(t, IPROC_NAND_CS_NAND_SELECT, cs_nand_sel);
+	cs_nand_sel |= (/*AUTO_DEVICE_ID_CONFIG*/1<<30);
+	target_mem_write32(t, IPROC_NAND_CS_NAND_SELECT, cs_nand_sel);
+
+	// give the NAND 1 second to initialize itself
+	uint32_t init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
+	while (!(init_status & (/*INIT_SUCCESS,FAIL,BLANK,TIMEOUT,UNC_ERROR,CORR_ERROR,PARAMETER_READY,AUTHENTICATION_FAIL*/0xff<<22))) {
+		init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
+	}
+	DEBUG("iproc nand init_status=%"PRIx32"\n", init_status);
+
+	if (!(init_status & (/*INIT_SUCCESS*/1<<29))) {
+		DEBUG("iproc NAND init failure, %"PRIx32"\n", init_status);
+		return -1;
+	}
+
+	// we already checked for ONFI during init
+
+	// configure for ONFI timing mode 0 (the slowest)
+	target_mem_write32(t, IPROC_NAND_TIMING_1_CS(0), 0xd8d8558d);
+	target_mem_write32(t, IPROC_NAND_TIMING_2_CS(0), 0x00000c83);
+
+	// configure for the controller to generate and check ECC and to use sub-page reads and writes
+	uint32_t acc_ctrl = target_mem_read32(t, IPROC_NAND_ACC_CONTROL_CS(0));
+	DEBUG("acc_ctrl %"PRIx32"\n", acc_ctrl);
+	acc_ctrl |= (/*RD_ECC_EN*/1<<31) + (/*WR_ECC_EN*/1<<30) + (/*FLAST_PGM_RDIN*/1<<28) +
+		(/*RD_ERASED_ECC_EN*/1<<27) + (/*PARTIAL_PAGE_EN*/1<<26) + (/*PAGE_HIT_EN*/1<<24);
+	target_mem_write32(t, IPROC_NAND_ACC_CONTROL_CS(0), acc_ctrl);
+
+	return 0;
+}
+
 // read from the flash. src ought to be nand-page aligned
 // if spare is non-NULL then the spare area is also read. there needs to be 64*num-subpages-per-page
 // NOTE the source argument is the byte offset from the base of flash, NOT a memory address
 static int iproc_flash_read(struct target_flash *f, uint32_t errors[2], uint8_t *dst, uint32_t offset, size_t len, uint8_t *spare)
 {
+	int rc = iproc_flash_init(f);
+	if (rc < 0)
+		return rc;
+
 	target *t = f->t;
 
 	if (errors) {
@@ -155,7 +229,7 @@ static int iproc_flash_read(struct target_flash *f, uint32_t errors[2], uint8_t 
 
 		if (dst) {
 			// copy out the data even if ECC failed
-			int rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), n);
+			rc = target_mem_read(t, dst, IPROC_NAND_FLASH_CACHE(0), n);
 			if (rc)
 				return rc;
 
@@ -164,7 +238,7 @@ static int iproc_flash_read(struct target_flash *f, uint32_t errors[2], uint8_t 
 		}
 
 		if (spare) {
-			int rc = target_mem_read(t, spare, IPROC_NAND_SPARE_AREA_READ(0), IPROC_SUBPAGE_SPARE_SIZE);
+			rc = target_mem_read(t, spare, IPROC_NAND_SPARE_AREA_READ(0), IPROC_SUBPAGE_SPARE_SIZE);
 			if (rc)
 				return rc;
 			uint32_endianess_swap(spare, IPROC_SUBPAGE_SPARE_SIZE);
@@ -220,6 +294,10 @@ static bool iproc_is_bad_block(struct target_flash *f, target_addr offset)
 
 static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t len)
 {
+	int rc = iproc_flash_init(f);
+	if (rc < 0)
+		return rc;
+
 	target *t = f->t;
 	addr -= f->start;
 
@@ -274,6 +352,10 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 
 static int iproc_flash_write_subpage(struct target_flash *f, target_addr dest, const void *src, size_t len)
 {
+	int rc = iproc_flash_init(f);
+	if (rc < 0)
+		return rc;
+
 	target *t = f->t;
 	dest -= f->start;
 
@@ -492,25 +574,6 @@ bool iproc_probe(target *t)
 		return false;
 	}
 
-	// do we need to reset the NAND controller and force it to reconfigure itself via ONFI?
-	// it might be a good idea if firmware left the NAND in a strange state.
-
-	// reset the NAND controller
-	target_mem_write32(t, IPROC_IDM_NAND_RESET_CONTROL, 1);
-	platform_delay(1);
-	target_mem_write32(t, IPROC_IDM_NAND_RESET_CONTROL, 0);
-	platform_delay(1);
-	uint32_t reset_ctrl = target_mem_read32(t, IPROC_IDM_NAND_RESET_CONTROL);
-	DEBUG("iproc reset_ctrl=%"PRIx32"\n", reset_ctrl);
-	if (reset_ctrl != 0) {
-		DEBUG("iproc nand stuck in reset\n");
-		return false;
-	}
-
-	// configure the NAND controller's APB and AXI interfaces
-	// we run them in their default endiannesses and fix it up in software here
-	target_mem_write32(t, IPROC_IDM_NAND_IO_CONTROL_DIRECT, (/*clk_enable*/1<<0));
-
 	// does it have a NAND controller we support? Earlier than rev 6 is untested
 	uint32_t nand_rev = target_mem_read32(t, IPROC_NAND_REVISION);
 	DEBUG("iproc nand_rev=%"PRIx32"\n", nand_rev);
@@ -519,20 +582,7 @@ bool iproc_probe(target *t)
 		return false;
 	}
 
-	// and re-init the NAND controller
-	uint32_t cs_nand_sel = target_mem_read32(t, IPROC_NAND_CS_NAND_SELECT);
-	DEBUG("iproc cs_nand_sel=%"PRIx32"\n", cs_nand_sel);
-	cs_nand_sel &= ~(/*DIRECT_ACCESS*/0xff<<0); // disable memory mapped NAND, so we can use the NAND controller
-	cs_nand_sel &= ~((/*AUTO_DEVICE_ID_CONFIG*/1<<30)+(/*NAND_WP*/1<<29)+(/*WR_PROTECT_BLK0*/1<<28));
-	target_mem_write32(t, IPROC_NAND_CS_NAND_SELECT, cs_nand_sel);
-	cs_nand_sel |= (/*AUTO_DEVICE_ID_CONFIG*/1<<30);
-	target_mem_write32(t, IPROC_NAND_CS_NAND_SELECT, cs_nand_sel);
-
-	// give the NAND 1 second to initialize itself
 	uint32_t init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
-	while (!(init_status & (/*INIT_SUCCESS,FAIL,BLANK,TIMEOUT,UNC_ERROR,CORR_ERROR,PARAMETER_READY,AUTHENTICATION_FAIL*/0xff<<22))) {
-		init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
-	}
 	DEBUG("iproc nand init_status=%"PRIx32"\n", init_status);
 
 	if (!(init_status & (/*INIT_SUCCESS*/1<<29))) {
@@ -551,16 +601,6 @@ bool iproc_probe(target *t)
 		// and parameter registers themselves, using what they know about the NAND given its' device ID.
 		return false;
 	}
-
-	// configure for ONFI timing mode 0 (the slowest)
-	target_mem_write32(t, IPROC_NAND_TIMING_1_CS(0), 0xd8d8558d);
-	target_mem_write32(t, IPROC_NAND_TIMING_2_CS(0), 0x00000c83);
-	// configure for the controller to generate and check ECC and to use sub-page reads and writes
-	uint32_t acc_ctrl = target_mem_read32(t, IPROC_NAND_ACC_CONTROL_CS(0));
-	DEBUG("acc_ctrl %"PRIx32"\n", acc_ctrl);
-	acc_ctrl |= (/*RD_ECC_EN*/1<<31) + (/*WR_ECC_EN*/1<<30) + (/*FLAST_PGM_RDIN*/1<<28) +
-		(/*RD_ERASED_ECC_EN*/1<<27) + (/*PARTIAL_PAGE_EN*/1<<26) + (/*PAGE_HIT_EN*/1<<24);
-	target_mem_write32(t, IPROC_NAND_ACC_CONTROL_CS(0), acc_ctrl);
 
 	if (!iproc_watchdog_disable(t)) {
 		DEBUG("Unable to disable iproc watchdog\n");
@@ -596,6 +636,7 @@ bool iproc_probe(target *t)
 		DEBUG("totalsize clamped to %"PRIu64"MB\n", totalsize>>20);
 	}
 
+	// define the NAND flash
 	struct iproc_flash* ff = calloc(1, sizeof(*ff));
 	ff->pagesize = bytes_per_page;
 	struct target_flash* f = (struct target_flash*)ff;
@@ -611,8 +652,12 @@ bool iproc_probe(target *t)
 
 	t->driver = "iproc";
 	target_add_commands(t, iproc_cmd_list, "iproc");
-	target_add_ram(t, 0x0, 256<<20);
+	target_add_ram(t, IPROC_SRAM_ADDR, IPROC_SRAM_SIZE);
+	target_add_ram(t, IPROC_DDR_WINDOW_1, IPROC_DDR_WINDOW_1_SIZE);
+	// add the 2nd DDR window? it overlaps with the lies we tell about NAND, so don't for now.
 	target_add_flash(t, f);
+	// add the NOR flash? my boards don't have one. really we should check the strapping and see what the boot device is
+	// and add either NOR or NAND as strapped.
 
 	return true;
 }

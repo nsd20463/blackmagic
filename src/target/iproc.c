@@ -304,7 +304,7 @@ static int iproc_flash_write_subpage(struct target_flash *f, target_addr dest, c
 	// The one thing we don't handle yet (and might not ever) is a block going bad during this write operation. If we wanted to we'd have to check that
 	// the erase and the write succeeded, and write bad block markers if they didn't, as well as rewrite the block's data in the next block. That, in
 	// turn, means erroring and restarting the whole operation, since we've lost the block's data by the time we realize the block is bad.
-	// (the BMP probably doesn't have the RAM to hold a whole NAND block's worth of data (256kB in a typical case))
+	// (the BMP probably doesn't have the RAM to hold a whole NAND block's worth of data (128kB in a typical case))
 
 	dest += ((struct iproc_flash*)f)->badblock_offset;
 
@@ -368,6 +368,7 @@ static int iproc_flash_write_subpage(struct target_flash *f, target_addr dest, c
 
 int iproc_flash_done_buffered(struct target_flash *f)
 {
+	DEBUG("iproc_flash_done_buffered; badblock_offset %u\n", (unsigned int)(((struct iproc_flash*)f)->badblock_offset));
 	// reset the badblock offset before the next write operation
 	((struct iproc_flash*)f)->badblock_offset = 0;
 	return target_flash_done_buffered(f);

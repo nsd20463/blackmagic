@@ -231,7 +231,7 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 		return -1;
 	}
 
-	// adjust for any bad blocks we've skipped (needed since gdb incrementally erases the flash as it writes)
+	// adjust for any bad blocks we've skipped (needed in case in the future gdb incrementally erases the flash as it writes; today (gdb 7.12) I see it perform a single multi-block erase before writing begins)
 	addr += ((struct iproc_flash*)f)->badblock_offset;
 
 	while ((ssize_t)len > 0) {

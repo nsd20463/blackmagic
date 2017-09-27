@@ -96,6 +96,7 @@
 struct iproc_flash {
 	struct target_flash f;
 	size_t pagesize; // learned from ONFI; typically 2048
+	target_addr badblock_offset; // byte offset due to bad blocks found during this write (typically each file written starts at a known page, and skips any bad blocks)
 };
 
 // convert to/from big-endian uint32
@@ -204,15 +205,14 @@ static bool iproc_is_bad_block(struct target_flash *f, target_addr offset)
 	// rather than the entire area (NAND_LARGE_BADBLOCK_POS). (Linux also considers
 	// the block bad if any bit is 0). That avoids the ECC bytes since ECC starts
 	// at the 3rd byte.
-	for (int j=0; j < 2; j++, offset += f->blocksize - page_size) {
+	for (int j=0; j < 2; j++) {
 		memset(buf, 0xff, sizeof(buf));
-		int rc = iproc_flash_read(f, NULL, NULL, offset, page_size, buf);
+		int rc = iproc_flash_read(f, NULL, NULL, offset + (j==0 ? 0 : f->blocksize - page_size), page_size, buf);
 		if (rc)
 			return true; // better to be safe
 
-		if (buf[0] != 0xff) { // same check as linux
+		if (buf[0] != 0xff) // same check as linux
 			return true;
-		}
 	}
 
 	return false;
@@ -230,6 +230,9 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 		tc_printf(t, "flash erase offset/len %u/%u is not block aligned\n", (unsigned int)addr, (unsigned int)len);
 		return -1;
 	}
+
+	// adjust for any bad blocks we've skipped (needed since gdb incrementally erases the flash as it writes)
+	addr += ((struct iproc_flash*)f)->badblock_offset;
 
 	while ((ssize_t)len > 0) {
 		// erase the block at offset 'addr'
@@ -269,16 +272,16 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 	return 0;
 }
 
-static int iproc_flash_write(struct target_flash *f, target_addr dest, const void *src, size_t len)
+static int iproc_flash_write_subpage(struct target_flash *f, target_addr dest, const void *src, size_t len)
 {
 	target *t = f->t;
 	dest -= f->start;
 
 	DEBUG("iproc write %u at %"PRIx32"\n", (unsigned int)len, dest);
 
-	// if dest or len are not sub-page aligned then consider the caller to be confused
-	if (dest & (IPROC_SUBPAGE_SIZE-1) || len & (IPROC_SUBPAGE_SIZE-1)) {
-		tc_printf(t, "flash erase offset/len %u/%u is not %d-byte sub-page aligned\n", (unsigned int)dest, (unsigned int)len, IPROC_SUBPAGE_SIZE);
+	// if dest is not sub-page aligned or len is not a single subpage then consider the caller to be confused
+	if (dest & (IPROC_SUBPAGE_SIZE-1) || len != IPROC_SUBPAGE_SIZE) {
+		tc_printf(t, "flash erase offset/len %u/%u is not a %d-byte sub-page\n", (unsigned int)dest, (unsigned int)len, IPROC_SUBPAGE_SIZE);
 		return -1;
 	}
 
@@ -294,65 +297,80 @@ static int iproc_flash_write(struct target_flash *f, target_addr dest, const voi
 	// goes wrong if you don't follow these rules, just the reliability is reduced. Remember that modern NANDs are so close to the reliability limit
 	// that they suffer from read-disturbances (where reading byte X occasionally disturbs a bit in byte Y, where Y can be in a different page than X)
 	//
-	// Note that handling bad blocks would require altering the generic buffered flash code, since it would have to accept the adjusted dest as a return
-	// parameter.
+	// Bad block handling in typical u-boot and filesystem (UBI) images is done by writing the image starting at a block address, and into successive pages
+	// skipping over any bad blocks that are encountered. This means that we have to adjust the 'dest' gdb supplies by the number of bad block bytes we've
+	// skipped so far during this write, and that also means we have to make sure the erase erases the adjusted block.
+	//
+	// The one thing we don't handle yet (and might not ever) is a block going bad during this write operation. If we wanted to we'd have to check that
+	// the erase and the write succeeded, and write bad block markers if they didn't, as well as rewrite the block's data in the next block. That, in
+	// turn, means erroring and restarting the whole operation, since we've lost the block's data by the time we realize the block is bad.
+	// (the BMP probably doesn't have the RAM to hold a whole NAND block's worth of data (256kB in a typical case))
 
-	bool first = true;
-	while ((ssize_t)len > 0) {
-		DEBUG("iproc write sub-page at %"PRIx32"\n", dest);
+	dest += ((struct iproc_flash*)f)->badblock_offset;
 
-		if (first || (dest & (f->blocksize-1)) == 0) {
-			first = false;
-			// check that the block isn't marked bad before writing to it
-			if (iproc_is_bad_block(f, dest)) {
-				DEBUG("skipping bad block %u\n", (unsigned int)dest);
-				dest += f->blocksize;
-				continue;
-			}
+	DEBUG("iproc write sub-page at %"PRIx32"\n", dest);
+
+	if ((dest & (f->blocksize-1)) == 0) {
+		// we're starting a new block; check that the block isn't marked bad before writing to it
+		while (iproc_is_bad_block(f, dest)) {
+			((struct iproc_flash*)f)->badblock_offset += f->blocksize;
+			DEBUG("skipping bad block %u; bad block offset 0x%x\n", (unsigned int)dest, (unsigned int)(((struct iproc_flash*)f)->badblock_offset));
+			dest += f->blocksize;
+			if (dest >= f->length)
+				break;
 		}
+	}
 
-		// the address needs to be set up before copying into the flash cache
-		target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
-		target_mem_write32(t, IPROC_NAND_ADDRESS, dest);
+	if (dest >= f->length) {
+		tc_printf(t, "NAND is full\n");
+		return -1;
+	}
 
-		// byte-swap each uint32_t as we load it into the controller
-		for (size_t i=0; i<IPROC_SUBPAGE_SIZE/4; i++) {
-			uint32_t x;
-			memcpy(&x, src, 4);
-			src += 4;
-			x = htofrombe_uint32(x);
-			target_mem_write32(t, IPROC_NAND_FLASH_CACHE(i), x);
-		}
-		// the spare bytes are set to 1. the NAND controller will merge in the ECC bits is computes
-		for (size_t i=0; i<16; i++) {
-			target_mem_write32(t, IPROC_NAND_SPARE_AREA_WRITE(i), 0xffffffff);
-		}
+	// the address needs to be set up before copying into the flash cache
+	target_mem_write32(t, IPROC_NAND_EXT_ADDRESS, 0); // assume CS 0, and under 4 GB
+	target_mem_write32(t, IPROC_NAND_ADDRESS, dest);
 
-		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PROGRAM_PAGE<<24);
+	// byte-swap each uint32_t as we load it into the controller
+	for (size_t i=0; i<IPROC_SUBPAGE_SIZE/4; i++) {
+		uint32_t x;
+		memcpy(&x, src, 4);
+		src += 4;
+		x = htofrombe_uint32(x);
+		target_mem_write32(t, IPROC_NAND_FLASH_CACHE(i), x);
+	}
+	// the spare bytes are set to 1. the NAND controller will merge in the ECC bits it computes
+	for (size_t i=0; i<16; i++) {
+		target_mem_write32(t, IPROC_NAND_SPARE_AREA_WRITE(i), 0xffffffff);
+	}
 
-		// wait for controller to be done
-		uint32_t st = 0;
-		while (!(st & (/*CTRL_READY*/1<<31))) {
-			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
-		}
+	// start the controller's operation
+	target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PROGRAM_PAGE<<24);
 
-		if (st & (!(/*WP#*/1<<7))) {
-			// write-protect is enabled. possible if there is an external circuit
-			tc_printf(t, "NAND is write-protected\n");
-			return -1;
-		}
+	// wait for controller to be done
+	uint32_t st = 0;
+	while (!(st & (/*CTRL_READY*/1<<31))) {
+		st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+	}
 
-		if (st & (/*FAIL*/1<<0)) {
-			tc_printf(t, "NAND write at %u failed\n", (unsigned int)dest);
-			return -1;
-		}
+	if (st & (!(/*WP#*/1<<7))) {
+		// write-protect is enabled. possible if there is an external circuit
+		tc_printf(t, "NAND is write-protected\n");
+		return -1;
+	}
 
-		src = (const char*)src + IPROC_SUBPAGE_SIZE;
-		dest += IPROC_SUBPAGE_SIZE;
-		len -= IPROC_SUBPAGE_SIZE;
+	if (st & (/*FAIL*/1<<0)) {
+		tc_printf(t, "NAND write at %u failed\n", (unsigned int)dest);
+		return -1;
 	}
 
 	return 0;
+}
+
+int iproc_flash_done_buffered(struct target_flash *f)
+{
+	// reset the badblock offset before the next write operation
+	((struct iproc_flash*)f)->badblock_offset = 0;
+	return target_flash_done_buffered(f);
 }
 
 static bool iproc_cmd_id_hw(target *t)
@@ -581,14 +599,14 @@ bool iproc_probe(target *t)
 	ff->pagesize = bytes_per_page;
 	struct target_flash* f = (struct target_flash*)ff;
 	f->start = IPROC_NAND_WINDOW;
-	f->length = (size_t)totalsize;
+	f->length = (size_t)totalsize; // this isn't the window size, but the full NAND size. It's unclear to me which would be correct. Probably the window is enough, since it's unlikely we'd program more than that over jtag
 	f->blocksize = blocksize;
 	f->erase = iproc_flash_erase;
 	f->write = target_flash_write_buffered;
-	f->done = target_flash_done_buffered;
+	f->done = iproc_flash_done_buffered;
 	f->erased = 0xff;
 	f->buf_size = IPROC_SUBPAGE_SIZE;
-	f->write_buf = iproc_flash_write;
+	f->write_buf = iproc_flash_write_subpage;
 
 	t->driver = "iproc";
 	target_add_commands(t, iproc_cmd_list, "iproc");

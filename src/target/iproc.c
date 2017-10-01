@@ -215,12 +215,11 @@ static int iproc_flash_read(struct target_flash *f, uint32_t errors[2], uint8_t 
 		target_mem_write32(t, IPROC_NAND_ADDRESS, offset);
 		target_mem_write32(t, IPROC_NAND_CMD_START, (dst ? IPROC_NAND_OPCODE_PAGE_READ : IPROC_NAND_OPCODE_SPARE_AREA_READ)<<24);
 
-		// wait for controller to be done
-		uint32_t st;
-		while (true) {
+		// wait for controller to be done and the NAND to be ready
+		uint32_t st = 0;
+		const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*NAND ready*/1<<6);
+		while ((st & ready_bits) != ready_bits) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
-			if (st & (/*CTRL_READY*/1<<31))
-				break;
 		}
 
 		size_t n = len;
@@ -326,9 +325,10 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 		target_mem_write32(t, IPROC_NAND_ADDRESS, addr);
 		target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_BLOCK_ERASE<<24);
 
-		// wait for controller to be done
+		// wait for controller to be done and the NAND to be ready
 		uint32_t st = 0;
-		while (!(st & (/*CTRL_READY*/1<<31))) {
+		const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*NAND ready*/1<<6);
+		while ((st & ready_bits) != ready_bits) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
 		}
 
@@ -428,9 +428,10 @@ static int iproc_flash_write_subpage(struct target_flash *f, target_addr dest, c
 	// start the controller's operation
 	target_mem_write32(t, IPROC_NAND_CMD_START, IPROC_NAND_OPCODE_PROGRAM_PAGE<<24);
 
-	// wait for controller to be done
+	// wait for controller to be done and the NAND to be ready
 	uint32_t st = 0;
-	while (!(st & (/*CTRL_READY*/1<<31))) {
+	const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*NAND ready*/1<<6);
+	while ((st & ready_bits) != ready_bits) {
 		st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
 	}
 

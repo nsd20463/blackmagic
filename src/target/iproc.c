@@ -183,6 +183,8 @@ static int iproc_flash_init(struct target_flash *f)
 		(/*RD_ERASED_ECC_EN*/1<<27) + (/*PARTIAL_PAGE_EN*/1<<26) + (/*PAGE_HIT_EN*/1<<24);
 	target_mem_write32(t, IPROC_NAND_ACC_CONTROL_CS(0), acc_ctrl);
 
+	((struct iproc_flash*)f)->inited = 1;
+
 	return 0;
 }
 

@@ -160,7 +160,9 @@ static int iproc_flash_init(struct target_flash *f)
 
 	// give the NAND 1 second to initialize itself
 	uint32_t init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
-	while (!(init_status & (/*INIT_SUCCESS,FAIL,BLANK,TIMEOUT,UNC_ERROR,CORR_ERROR,PARAMETER_READY,AUTHENTICATION_FAIL*/0xff<<22))) {
+	platform_timeout to;
+	platform_timeout_set(&to, 1000);
+	while (!(init_status & (/*INIT_SUCCESS,FAIL,BLANK,TIMEOUT,UNC_ERROR,CORR_ERROR,PARAMETER_READY,AUTHENTICATION_FAIL*/0xff<<22)) && !platform_timeout_is_expired(&to)) {
 		init_status = target_mem_read32(t, IPROC_NAND_INIT_STATUS);
 	}
 	DEBUG("iproc nand init_status=%"PRIx32"\n", init_status);
@@ -219,9 +221,15 @@ static int iproc_flash_read(struct target_flash *f, uint32_t errors[2], uint8_t 
 
 		// wait for controller to be done and the NAND to be ready
 		uint32_t st = 0;
-		const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*NAND ready*/1<<6);
-		while ((st & ready_bits) != ready_bits) {
+		platform_timeout to;
+		platform_timeout_set(&to, 250);
+		const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*FLASH_READY*/1<<30);
+		while ((st & ready_bits) != ready_bits && !platform_timeout_is_expired(&to)) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+		}
+		if ((st & ready_bits) != ready_bits) {
+			tc_printf(t, "timeout reading NAND\n");
+			return -1;
 		}
 
 		size_t n = len;
@@ -329,9 +337,15 @@ static int iproc_flash_erase(struct target_flash *f, target_addr addr, size_t le
 
 		// wait for controller to be done and the NAND to be ready
 		uint32_t st = 0;
-		const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*NAND ready*/1<<6);
-		while ((st & ready_bits) != ready_bits) {
+		platform_timeout to;
+		platform_timeout_set(&to, 250);
+		const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*FLASH_READY*/1<<30);
+		while ((st & ready_bits) != ready_bits && !platform_timeout_is_expired(&to)) {
 			st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+		}
+		if ((st & ready_bits) != ready_bits) {
+			tc_printf(t, "timeout erasing NAND block at %u\n", (unsigned int)addr);
+			return -1;
 		}
 
 		if (st & (!(/*WP#*/1<<7))) {
@@ -432,9 +446,15 @@ static int iproc_flash_write_subpage(struct target_flash *f, target_addr dest, c
 
 	// wait for controller to be done and the NAND to be ready
 	uint32_t st = 0;
-	const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*NAND ready*/1<<6);
-	while ((st & ready_bits) != ready_bits) {
+	platform_timeout to;
+	platform_timeout_set(&to, 250);
+	const uint32_t ready_bits = (/*CTRL_READY*/1<<31) + (/*FLASH_READY*/1<<30);
+	while ((st & ready_bits) != ready_bits && !platform_timeout_is_expired(&to)) {
 		st = target_mem_read32(t, IPROC_NAND_INTFC_STATUS);
+	}
+	if ((st & ready_bits) != ready_bits) {
+		tc_printf(t, "timeout programming NAND subpage at %u\n", (unsigned int)dest);
+		return -1;
 	}
 
 	if (st & (!(/*WP#*/1<<7))) {

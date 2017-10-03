@@ -550,9 +550,42 @@ static bool iproc_cmd_nand_read(target *t, int argc, const char *argv[])
 	return true;
 }
 
+static bool iproc_cmd_nand_bad_blocks(target *t, int argc, const char *argv[])
+{
+	(void)argc;
+	(void)argv;
+
+	struct target_flash* f = t->flash;
+	if (!f) {
+		// no flash was found
+		return false;
+	}
+
+	int rc = iproc_flash_init(f);
+	if (rc < 0)
+		return false;
+
+	DEBUG("bad blocksize %u, length %u\n", (unsigned int)f->blocksize, (unsigned int)f->length);
+	target_addr offset;
+	unsigned int n = 0;
+	unsigned int N = 0;
+	for (offset=0; offset < f->length; offset += f->blocksize) {
+		tc_printf(t, "."); // print something to keep gdb happy. otherwise, since this takes 30 seconds on a large NAND, it thinks we're gone
+		if (iproc_is_bad_block(f, offset)) {
+			tc_printf(t, "\nblock %u at 0x%"PRIx32" is bad\n", (unsigned int)(offset/f->blocksize), offset+f->start);
+			n++;
+		}
+		N++;
+	}
+	tc_printf(t, "\n%u out of %u blocks are bad\n", n, N);
+
+	return true;
+}
+
 const struct command_s iproc_cmd_list[] = {
 	{"id-hw", (cmd_handler)iproc_cmd_id_hw, "Show iproc id registers"},
 	{"nand-read", iproc_cmd_nand_read, "Show NAND page"},
+	{"nand-bad-blocks", iproc_cmd_nand_bad_blocks, "Show NAND bad blocks"},
 	{NULL, NULL, NULL}
 };
 

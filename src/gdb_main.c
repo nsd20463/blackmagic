@@ -421,7 +421,7 @@ handle_v_packet(char *packet, int plen)
 		if(!flash_mode) {
 			/* Reset target if first flash command! */
 			/* This saves us if we're interrupted in IRQ context */
-			target_reset(cur_target);
+			//target_reset(cur_target);
 			flash_mode = 1;
 		}
 		if(target_flash_erase(cur_target, addr, len) == 0)

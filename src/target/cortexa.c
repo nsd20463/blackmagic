@@ -533,6 +533,7 @@ static void cortexa_regs_write_internal(target *t)
 
 static void cortexa_reset(target *t)
 {
+#if 0 // this Xilinix specific part interferes with other targets
 	/* This mess is Xilinx Zynq specific
 	 * See Zynq-7000 TRM, Xilinx doc UG585
 	 */
@@ -541,11 +542,13 @@ static void cortexa_reset(target *t)
 #define ZYNQ_SLCR_PSS_RST_CTRL 0xf8000200
 	target_mem_write32(t, ZYNQ_SLCR_UNLOCK, ZYNQ_SLCR_UNLOCK_KEY);
 	target_mem_write32(t, ZYNQ_SLCR_PSS_RST_CTRL, 1);
+#endif
 
 	/* Try hard reset too */
 	platform_srst_set_val(true);
 	platform_srst_set_val(false);
 
+#if 0
 	/* Spin until Xilinx reconnects us */
 	platform_timeout timeout;
 	platform_timeout_set(&timeout, 1000);
@@ -557,6 +560,7 @@ static void cortexa_reset(target *t)
 	} while (!platform_timeout_is_expired(&timeout) && e.type == EXCEPTION_ERROR);
 	if (e.type == EXCEPTION_ERROR)
 		raise_exception(e.type, e.msg);
+#endif
 
 	platform_delay(100);
 

@@ -51,6 +51,7 @@ void jtagtap_reset(void)
 	jtagtap_soft_reset();
 }
 
+#ifndef PLATFIRM_HAS_JTAGTAP_NEXT
 inline uint8_t jtagtap_next(uint8_t dTMS, uint8_t dTDI)
 {
 	uint16_t ret;
@@ -65,4 +66,4 @@ inline uint8_t jtagtap_next(uint8_t dTMS, uint8_t dTDI)
 
 	return ret != 0;
 }
-
+#endif

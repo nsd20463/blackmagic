@@ -37,6 +37,7 @@ SRC =			\
 	iproc.c		\
 	jtag_scan.c	\
 	jtagtap.c	\
+	jtagtap_next.c	\
 	jtagtap_generic.c	\
 	lmi.c		\
 	lpc_common.c	\

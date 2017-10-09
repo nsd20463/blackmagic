@@ -1,0 +1,5 @@
+target extended-remote /dev/ttyBMP_gdb
+monitor debug_bmp enable
+monitor jtag_scan
+attach 1
+set mem inaccessible-by-default off
